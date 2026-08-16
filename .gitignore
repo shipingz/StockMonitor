@@ -185,3 +185,6 @@ logs/
 
 # local deployment guide (kept out of repo)
 DEPLOY.md
+
+# 股票代码翻译表（本地私有）
+stock_list_traslate/
