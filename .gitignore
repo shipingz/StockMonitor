@@ -180,5 +180,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# 本项目运行日志（Actions 中由 workflow 上传 artifact）
+# project run logs (uploaded as Actions artifact)
 logs/
+
+# local deployment guide (kept out of repo)
+DEPLOY.md
