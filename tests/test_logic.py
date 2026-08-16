@@ -16,17 +16,21 @@ sys.path.insert(0, ".")
 from main import (  # noqa: E402
     KLINE_CLOSE_TIMES,
     MA_PERIOD,
+    build_realtime_signal_block,
     build_replay_message,
     build_signal_block,
     compute_ma_signal,
+    compute_realtime_signal,
     extract_feishu_card_title,
     format_feishu_markdown,
     heartbeat_message,
     is_eastmoney_target,
+    is_trading_time,
     pack_signal_messages,
     parse_replay_date,
     parse_sina_kline_jsonp,
     parse_sina_name_response,
+    parse_sina_quotes,
     parse_stock_list,
     random_user_agent,
     replay_signals_for_stock,
@@ -433,6 +437,117 @@ class TestFetchConcurrency(unittest.TestCase):
         self.assertEqual(len(klines), 3)
         self.assertEqual(failed, [])
         self.assertEqual(calls, ["600519", "000001", "300750"])  # 串行有序
+
+
+class TestRealtimeSignal(unittest.TestCase):
+    """ADR-0016 实时价判定（锚点法）：锚点前一根收盘价 ≤ MA60 < 实时价。"""
+
+    def test_cross_above_detected(self):
+        # 锚点前一根在 MA 下方，实时价已越线 → 上穿
+        closes = make_closes(last=10.5, prev=9.5)  # 序列末尾 prev=9.5, cur=10.5
+        sig = compute_realtime_signal(closes, realtime_price=10.8)
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig["cross_above"])
+        self.assertLessEqual(sig["prev_close"], sig["cur_ma"])
+        self.assertLess(sig["cur_ma"], sig["realtime_price"])
+
+    def test_no_cross_when_price_below_ma(self):
+        closes = make_closes(last=10.5, prev=9.5)
+        sig = compute_realtime_signal(closes, realtime_price=10.0)  # 实时价仍在 MA 下方
+        self.assertIsNotNone(sig)
+        self.assertFalse(sig["cross_above"])
+
+    def test_no_cross_when_anchor_prev_above_ma(self):
+        # 锚点前一根收盘价已 > MA → 不算从下方穿越（锚点法防误报）
+        closes = make_closes(last=12.0, prev=11.8)
+        sig = compute_realtime_signal(closes, realtime_price=12.5)
+        self.assertIsNotNone(sig)
+        self.assertFalse(sig["cross_above"])
+
+    def test_insufficient_data_returns_none(self):
+        closes = [10.0] * MA_PERIOD
+        self.assertIsNone(compute_realtime_signal(closes, 10.5))
+
+    def test_ma_includes_anchor_bar(self):
+        closes = make_closes(last=100.0, prev=10.0, n=70, base=10.0)
+        sig = compute_realtime_signal(closes, realtime_price=101.0)
+        self.assertIsNotNone(sig)
+        self.assertAlmostEqual(sig["cur_ma"], sum(closes[-MA_PERIOD:]) / MA_PERIOD)
+
+
+class TestTradingTimeGuard(unittest.TestCase):
+    """ADR-0016 交易时段护栏：9:30 ≤ 时间 ≤ 15:10。"""
+
+    def _t(self, h: int, m: int) -> datetime:
+        return datetime(2026, 8, 17, h, m, tzinfo=TZ_CN)
+
+    def test_within_morning_session(self):
+        self.assertTrue(is_trading_time(self._t(9, 30)))
+        self.assertTrue(is_trading_time(self._t(10, 4)))
+        self.assertTrue(is_trading_time(self._t(11, 30)))
+
+    def test_within_afternoon_session(self):
+        self.assertTrue(is_trading_time(self._t(13, 0)))
+        self.assertTrue(is_trading_time(self._t(14, 55)))
+        self.assertTrue(is_trading_time(self._t(15, 0)))
+        self.assertTrue(is_trading_time(self._t(15, 10)))  # 上限余量
+
+    def test_outside_sessions(self):
+        self.assertFalse(is_trading_time(self._t(9, 15)))   # 盘前
+        self.assertFalse(is_trading_time(self._t(11, 35)))  # 午休
+        self.assertFalse(is_trading_time(self._t(12, 0)))   # 午休
+        self.assertFalse(is_trading_time(self._t(15, 15)))  # 收盘后
+        self.assertFalse(is_trading_time(self._t(16, 0)))
+
+
+class TestSinaQuotes(unittest.TestCase):
+    """ADR-0016 实时价解析：hq.sinajs.cn 行情响应。"""
+
+    def test_parse_quotes_with_price(self):
+        text = (
+            'var hq_str_sh600519="贵州茅台,1700.00,1699.00,1710.00,1715.00,1680.00";\n'
+            'var hq_str_sz000001="平安银行,11.00,10.90,11.10,11.20,10.80";\n'
+        )
+        quotes = parse_sina_quotes(text)
+        self.assertEqual(quotes["600519"][0], "贵州茅台")
+        self.assertAlmostEqual(quotes["600519"][1], 1710.00)  # 字段3=最新价
+        self.assertAlmostEqual(quotes["000001"][1], 11.10)
+
+    def test_parse_quotes_empty_price(self):
+        text = 'var hq_str_sh600519="贵州茅台,1700.00,1699.00,,1715.00,1680.00";\n'
+        quotes = parse_sina_quotes(text)
+        self.assertIsNone(quotes["600519"][1])  # 空价格 → None
+
+    def test_parse_quotes_skip_empty_lines(self):
+        self.assertEqual(parse_sina_quotes(""), {})
+        self.assertEqual(parse_sina_quotes('var hq_str_sh600999="";\n'), {})
+
+
+class TestRealtimeMessage(unittest.TestCase):
+    """ADR-0016 实时价信号消息与心跳。"""
+
+    def test_realtime_signal_block_fields(self):
+        check = datetime(2026, 8, 17, 10, 4, tzinfo=TZ_CN)
+        anchor = datetime(2026, 8, 17, 10, 0, tzinfo=TZ_CN)
+        sig = {
+            "realtime_price": 1710.0,
+            "cur_ma": 1700.0,
+            "prev_close": 1690.0,
+            "cross_above": True,
+            "deviation_pct": 0.59,
+        }
+        block = build_realtime_signal_block("600519", "贵州茅台", check, anchor, sig)
+        self.assertIn("贵州茅台（600519）", block)
+        self.assertIn("检测 10:04（锚点K线 10:00）", block)  # 锚点时间戳供重复识别
+        self.assertIn("1,710.00", block)
+        self.assertIn("1,700.00", block)
+        self.assertIn("实时价上穿 MA60", block)
+
+    def test_heartbeat_label_realtime(self):
+        now = datetime(2026, 8, 17, 10, 4, tzinfo=TZ_CN)
+        msg = heartbeat_message(now, 50, 0, label="检测")
+        self.assertIn("检测 10:04", msg)
+        self.assertNotIn("K线", msg)
 
 
 if __name__ == "__main__":

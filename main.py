@@ -283,6 +283,40 @@ def parse_sina_name_response(text: str) -> Dict[str, str]:
     return result
 
 
+def parse_sina_quotes(text: str) -> Dict[str, Tuple[str, Optional[float]]]:
+    """解析 hq.sinajs.cn 行情响应（已按 GBK 解码）→ {code: (名称, 最新价)}。
+
+    新浪字段顺序：0=名称, 1=今开, 2=昨收, 3=最新价, ...；最新价可能为空（停牌/无成交）→ None。
+    """
+    result: Dict[str, Tuple[str, Optional[float]]] = {}
+    for line in (text or "").splitlines():
+        m = re.match(r'var hq_str_(?:sh|sz)(\d{6})="([^"]*)"', line)
+        if not m:
+            continue
+        fields = m.group(2).split(",")
+        if len(fields) < 4 or not fields[0].strip():
+            continue
+        price_raw = fields[3].strip()
+        try:
+            price = float(price_raw) if price_raw else None
+        except ValueError:
+            price = None
+        result[m.group(1)] = (fields[0].strip(), price)
+    return result
+
+
+def is_trading_time(now: datetime) -> bool:
+    """ADR-0016 交易时段护栏：上午 9:30–11:30、下午 13:00–15:10 内才做实时价判定。
+
+    下午上限留 10 分钟余量给 15:00 收盘轮次的 job 延迟（15:00 收盘后实时价=收盘价，仍有意义）；
+    9:30~9:45 由「最新已收盘K线必须是今天」护栏（ADR-0006）自然拦截；午休（11:30–13:00）不判定。
+    """
+    minutes = now.hour * 60 + now.minute
+    morning = 9 * 60 + 30 <= minutes <= 11 * 60 + 30
+    afternoon = 13 * 60 <= minutes <= 15 * 60 + 10
+    return morning or afternoon
+
+
 def parse_sina_kline_jsonp(text: str) -> Optional[pd.DataFrame]:
     """解析新浪分钟K线 JSONP：'var _data=[{\"day\":\"2026-08-14 10:00:00\",\"close\":\"1700.00\",...},...];'
     返回 时间/收盘 两列（时间升序）。解析失败返回 None。
@@ -325,7 +359,7 @@ def fetch_name_map(codes: List[str]) -> Dict[str, str]:
     失败时 fallback 东财 stock_info_a_code_name（重试 FETCH_ATTEMPTS 次）。
     全部失败返回空 dict，名称退化为代码。
     """
-    # 1) 新浪批量（只查自选股，一次请求）
+    # 1) 新浪批量（只查自选股，一次请求；顺带解析最新价）
     try:
         symbols = ",".join(sina_symbol(c) for c in codes)
         resp = requests.get(
@@ -334,7 +368,8 @@ def fetch_name_map(codes: List[str]) -> Dict[str, str]:
             timeout=15,
         )
         resp.encoding = "gbk"
-        name_map = parse_sina_name_response(resp.text)
+        quotes = parse_sina_quotes(resp.text)
+        name_map = {c: name for c, (name, _) in quotes.items()}
         if name_map:
             logger.info("名称映射：新浪批量接口成功（%d/%d 只）", len(name_map), len(codes))
             return name_map
@@ -502,6 +537,49 @@ def compute_ma_signal(closes: Sequence[float], period: int = MA_PERIOD) -> Optio
     }
 
 
+def compute_realtime_signal(
+    closes: Sequence[float],
+    realtime_price: float,
+    period: int = MA_PERIOD,
+) -> Optional[dict]:
+    """ADR-0016 实时价上穿判定（锚点法，无状态）：
+      cur_ma  = 最近 period 根已收盘K线收盘价均值（含最新已收盘根=锚点，口径1）
+      上穿    = 锚点前一根收盘价 ≤ cur_ma < 当前实时价
+    历史不足 period+1 根返回 None（调用方跳过该股，ADR-0004）。
+    """
+    closes = [float(c) for c in closes]
+    if len(closes) < period + 1:
+        return None
+    prev_close = closes[-2]
+    cur_ma = sum(closes[-period:]) / period
+    cross_above = prev_close <= cur_ma < realtime_price
+    deviation_pct = (realtime_price - cur_ma) / cur_ma * 100 if cur_ma else 0.0
+    return {
+        "realtime_price": realtime_price,
+        "prev_close": prev_close,
+        "cur_ma": cur_ma,
+        "cross_above": cross_above,
+        "deviation_pct": deviation_pct,
+    }
+
+
+def fetch_realtime_quotes(codes: List[str]) -> Dict[str, float]:
+    """新浪批量实时价（ADR-0016）：hq.sinajs.cn 一次请求全部自选股 → {code: 最新价}。"""
+    try:
+        symbols = ",".join(sina_symbol(c) for c in codes)
+        resp = requests.get(
+            f"https://hq.sinajs.cn/list={symbols}",
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=15,
+        )
+        resp.encoding = "gbk"
+        quotes = parse_sina_quotes(resp.text)
+        return {c: p for c, (_, p) in quotes.items() if p is not None}
+    except Exception as exc:
+        logger.error("实时价获取失败: %s", exc)
+        return {}
+
+
 def format_price(value: float) -> str:
     return f"{value:,.2f}"
 
@@ -517,6 +595,23 @@ def build_signal_block(symbol: str, name: str, kline_time: datetime, sig: dict) 
                 f" ｜ 偏离：{sig['deviation_pct']:+.2f}%"
             ),
             "**上穿信号**：收盘价上穿 MA%d" % MA_PERIOD,
+        ]
+    )
+
+
+def build_realtime_signal_block(
+    symbol: str, name: str, check_time: datetime, anchor_time: datetime, sig: dict
+) -> str:
+    """ADR-0016 实时价信号块：标注检测时刻与锚点K线时间戳（重复推送人工识别用）。"""
+    return "\n".join(
+        [
+            f"**{name}（{symbol}）**｜检测 {check_time:%H:%M}（锚点K线 {anchor_time:%H:%M}）",
+            (
+                f"实时价：{format_price(sig['realtime_price'])}"
+                f" ｜ MA{MA_PERIOD}：{format_price(sig['cur_ma'])}"
+                f" ｜ 偏离：{sig['deviation_pct']:+.2f}%"
+            ),
+            "**上穿信号**：实时价上穿 MA%d" % MA_PERIOD,
         ]
     )
 
@@ -547,9 +642,17 @@ def pack_signal_messages(
     return messages
 
 
-def heartbeat_message(kline_time: datetime, checked: int, signal_count: int) -> str:
-    """ADR-0010 心跳：无信号时推送「系统正常」确认。"""
-    return f"✅ 系统正常 | K线 {kline_time:%H:%M} | 检查 {checked} 只 | {signal_count} 信号"
+def heartbeat_message(
+    check_time: datetime,
+    checked: int,
+    signal_count: int,
+    label: str = "K线",
+) -> str:
+    """ADR-0010 心跳：无信号时推送「系统正常」确认。
+
+    label 区分模式：K线收盘模式显示锚点K线时间，实时价模式（ADR-0016）显示检测时刻。
+    """
+    return f"✅ 系统正常 | {label} {check_time:%H:%M} | 检查 {checked} 只 | {signal_count} 信号"
 
 
 def alarm_message(alarms: List[str]) -> str:
@@ -942,6 +1045,11 @@ def main() -> int:
     else:
         logger.info("force_run 模式，跳过交易日历检查")
 
+    # 1.5 交易时段护栏（ADR-0016）：实时价在非交易时段是停滞的最后成交价，判定无意义
+    if not is_trading_time(now):
+        logger.info("当前时间 %s 不在交易时段（9:30–15:10），退出（0 推送）", now)
+        return 0
+
     # 2. 自选股解析（ADR-0001/0009）
     codes = parse_stock_list(STOCK_LIST_RAW)
     if not codes:
@@ -956,14 +1064,14 @@ def main() -> int:
     if missing_codes:
         alarms.append(f"代码表中未找到：{', '.join(missing_codes)}（名称将显示为代码）")
 
-    # 4. 抓取 15 分钟K线（串行 + 限速 + 重试，ADR-0011）
+    # 4. 抓取 15 分钟K线（并发 + 限速 + 重试，ADR-0011）
     klines, failed_codes = fetch_all_klines(codes)
     if not klines:
         alarms.append(f"本轮全部股票抓取失败（{len(codes)} 只），数据源可能故障")
         send_messages([alarm_message(alarms)])
         return 0
 
-    # 5. 护栏：最新已收盘K线日期与新鲜度（ADR-0006 修订版，保证 15:03 轮不被误杀）
+    # 5. 护栏：最新已收盘K线日期与新鲜度（ADR-0006 修订版）
     cleaned: Dict[str, pd.DataFrame] = {}
     latest_times: List[pd.Timestamp] = []
     for code, df in klines.items():
@@ -991,36 +1099,54 @@ def main() -> int:
         return 0
     logger.info("最新已收盘K线: %s（距今 %.0f 分钟），正常处理", latest, age_minutes)
 
-    # 6. 信号判定（ADR-0002：A型上穿 + MA 口径1）
-    signals: List[Tuple[str, str, datetime, dict]] = []  # (code, name, kline_time, sig)
+    # 6. 实时价获取（ADR-0016：新浪 hq.sinajs.cn 批量，1 次请求）
+    realtime_prices = fetch_realtime_quotes(codes)
+    if not realtime_prices:
+        alarms.append("实时价获取失败，本轮跳过")
+        send_messages([alarm_message(alarms)])
+        return 0
+    logger.info("实时价获取成功：%d/%d 只", len(realtime_prices), len(codes))
+
+    # 7. 实时价上穿判定（ADR-0016 锚点法：锚点前一根收盘价 ≤ MA60 < 实时价）
+    signals: List[Tuple[str, str, datetime, datetime, dict]] = []  # (code, name, check_time, anchor_time, sig)
     skipped_codes: List[str] = []
     for code, df in cleaned.items():
+        price = realtime_prices.get(code)
+        if price is None:
+            logger.warning("%s 无实时价，跳过", code)
+            skipped_codes.append(code)
+            continue
         try:
             closes = pd.to_numeric(df["收盘"], errors="coerce").dropna().tolist()
         except Exception as exc:
             logger.warning("%s 收盘价列解析失败，跳过: %s", code, exc)
             skipped_codes.append(code)
             continue
-        sig = compute_ma_signal(closes)
+        sig = compute_realtime_signal(closes, price)
         if sig is None:
             logger.info("%s 历史K线不足 %d 根（实际 %d 根），跳过（ADR-0004）", code, MIN_BARS, len(closes))
             skipped_codes.append(code)
             continue
         if sig["cross_above"]:
-            kline_time = df["时间"].iloc[-1].to_pydatetime()
-            signals.append((code, name_map.get(code, code), kline_time, sig))
+            anchor_time = df["时间"].iloc[-1].to_pydatetime()
+            signals.append((code, name_map.get(code, code), now, anchor_time, sig))
     logger.info(
-        "检查 %d 只，上穿信号 %d 个，跳过 %d 只（数据不足/解析失败）",
+        "检查 %d 只，实时价上穿信号 %d 个，跳过 %d 只（数据不足/无实时价）",
         len(cleaned), len(signals), len(skipped_codes),
     )
 
-    # 7. 消息（ADR-0010 三态互斥 + ADR-0007 拆分；ADR-0008 告警并入）
+    # 8. 消息（ADR-0010 三态互斥 + ADR-0007 拆分；ADR-0008 告警并入）
     contents: List[str] = []
     if signals:
-        blocks = [build_signal_block(code, name, kt, sig) for code, name, kt, sig in signals]
-        contents = pack_signal_messages(blocks)
+        blocks = [
+            build_realtime_signal_block(code, name, check_time, anchor_time, sig)
+            for code, name, check_time, anchor_time, sig in signals
+        ]
+        contents = pack_signal_messages(
+            blocks, header=f"## 📈 MA{MA_PERIOD} 上穿信号（实时价）"
+        )
     else:
-        contents = [heartbeat_message(latest.to_pydatetime(), len(cleaned), 0)]
+        contents = [heartbeat_message(now, len(cleaned), 0, label="检测")]
 
     if alarms:
         alarm_text = alarm_message(alarms)
