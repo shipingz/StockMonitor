@@ -1,8 +1,8 @@
 # A股 15分钟K线 MA60 上穿监控
 
-在 GitHub Actions 上定时运行的 A 股监控工具：每个交易日 16 根 15 分钟K线收盘后 3 分钟触发检查，检测自选股「收盘价上穿 MA60」信号，通过企业微信机器人 Webhook 推送。
+在 GitHub Actions 上定时运行的 A 股监控工具：每个交易日 16 根 15 分钟K线收盘后 3 分钟触发检查，检测自选股「收盘价上穿 MA60」信号，通过企业微信机器人和/或飞书群机器人 Webhook 推送（有哪个推哪个）。
 
-设计决策全部记录在 [CONTEXT.md](CONTEXT.md)（术语表/决策索引/事实约束）与 [docs/adr/](docs/adr/)（ADR-0001 ~ ADR-0012）。
+设计决策全部记录在 [CONTEXT.md](CONTEXT.md)（术语表/决策索引/事实约束）与 [docs/adr/](docs/adr/)（ADR-0001 ~ ADR-0014）。
 
 ## 工作原理
 
@@ -12,6 +12,7 @@
   - 📈 **信号**：有上穿信号时（多只合并一条，超长自动拆分）
   - ✅ **心跳**：无信号时推送「系统正常」确认
   - ⚠️ **告警**：整轮抓取失败 / 交易日历失败 / 严重延迟
+  - 推送渠道：企业微信（markdown）与/或飞书（interactive 卡片 + lark_md，text 降级），有哪个推哪个（[ADR-0014](docs/adr/ADR-0014-multi-channel-push.md)）
 - **无状态**：不做跨运行持久化（[ADR-0005](docs/adr/ADR-0005-stateless-design.md)），去重由调度频率天然保证。
 - **容错**：串行抓取 + 随机 2~5 秒限速 + 指数退避重试（最多 3 次尝试），照抄参考项目 [daily_stock_analysis](https://github.com/ZhuLinsen/daily_stock_analysis)（[ADR-0011](docs/adr/ADR-0011-fetch-retry-policy.md)）。
 
@@ -21,8 +22,12 @@
 
 | 配置项 | 位置 | 示例 | 说明 |
 |---|---|---|---|
-| `WECHAT_WEBHOOK_URL` | **Secrets** | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx` | 企业微信群机器人 Webhook（机密） |
+| `WECHAT_WEBHOOK_URL` | **Secrets** | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx` | 企业微信群机器人 Webhook（可选，配置了才推企微） |
+| `FEISHU_WEBHOOK_URL` | **Secrets** | `https://open.feishu.cn/open-apis/bot/v2/hook/xxx` | 飞书群机器人 Webhook（可选，配置了才推飞书） |
+| `FEISHU_WEBHOOK_SECRET` | **Secrets** | `xxxx` | 飞书机器人「加签」密钥（可选，仅在机器人开启加签时配置） |
 | `STOCK_LIST` | **Variables** | `600519,000001,300750` | 自选股，逗号分隔纯 6 位代码，≤50 只 |
+
+推送渠道规则（[ADR-0014](docs/adr/ADR-0014-multi-channel-push.md)）：**有哪个推哪个，都有都推**；两个都没配且非 dry-run 时报错退出。
 
 将来新增设置项（MA 周期、重试次数、消息阈值等）统一放 **Variables**，代码从环境变量读取并带默认值（[ADR-0009](docs/adr/ADR-0009-config-management.md)）。
 

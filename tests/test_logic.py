@@ -18,6 +18,8 @@ from main import (  # noqa: E402
     build_replay_message,
     build_signal_block,
     compute_ma_signal,
+    extract_feishu_card_title,
+    format_feishu_markdown,
     heartbeat_message,
     pack_signal_messages,
     parse_replay_date,
@@ -283,5 +285,37 @@ class TestReplayMessage(unittest.TestCase):
         self.assertLess(msgs[0].index("K线 10:00"), msgs[0].index("K线 14:30"))  # 时间升序
 
 
+class TestFeishuFormatting(unittest.TestCase):
+    """ADR-0014 飞书渠道：标题提取与 lark_md 方言转换。"""
+
+    def test_extract_title_from_signal_message(self):
+        content = "## 📈 MA60 上穿信号（15分钟K线）\n\n**贵州茅台（600519）**｜K线 10:00"
+        title, body = extract_feishu_card_title(content)
+        self.assertEqual(title, "📈 MA60 上穿信号（15分钟K线）")
+        self.assertNotIn("##", body)
+        self.assertIn("贵州茅台", body)
+
+    def test_extract_title_absent(self):
+        content = "✅ 系统正常 | K线 10:00 | 检查 50 只 | 0 信号"
+        title, body = extract_feishu_card_title(content)
+        self.assertEqual(title, "")
+        self.assertEqual(body, content)
+
+    def test_format_feishu_markdown_headings_and_bullets(self):
+        content = "## 标题\n- 条目一\n- 条目二\n**加粗**"
+        out = format_feishu_markdown(content)
+        self.assertIn("**标题**", out)  # # 标题 → 加粗（lark_md 不支持 #）
+        self.assertIn("• 条目一", out)  # - 列表 → • 列表
+        self.assertIn("**加粗**", out)  # 原生支持保留
+
+    def test_format_feishu_markdown_no_heading_marker_left(self):
+        out = format_feishu_markdown("## ⚠️ 监控异常\n- 严重延迟")
+        self.assertNotIn("##", out)
+        self.assertIn("**⚠️ 监控异常**", out)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+

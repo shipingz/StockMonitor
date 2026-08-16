@@ -12,13 +12,17 @@ A股 15分钟K线 MA60 上穿监控
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import logging
 import os
 import random
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -62,6 +66,9 @@ WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "").strip()
 STOCK_LIST_RAW = os.environ.get("STOCK_LIST", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
 FORCE_RUN = os.environ.get("FORCE_RUN", "").strip().lower() in ("1", "true", "yes", "on")
+# 飞书自定义机器人 Webhook（ADR-0014：多渠道推送，有哪个推哪个）
+FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "").strip()
+FEISHU_WEBHOOK_SECRET = os.environ.get("FEISHU_WEBHOOK_SECRET", "").strip()
 # 复盘模式（ADR-0013）：计算最近一个完整交易日当天全部信号，非交易日验证用
 REPLAY = os.environ.get("REPLAY", "").strip().lower() in ("1", "true", "yes", "on")
 REPLAY_DATE = os.environ.get("REPLAY_DATE", "").strip()
@@ -276,28 +283,126 @@ def alarm_message(alarms: List[str]) -> str:
     return "## ⚠️ 监控异常\n\n" + "\n".join(f"- {a}" for a in alarms)
 
 
-def send_wechat_messages(contents: List[str]) -> None:
-    """推送消息列表。dry_run 模式只打印不推送；推送失败记日志（ADR-0005 不重试不补偿）。"""
+def send_wechat_message(content: str) -> bool:
+    """推送单条消息到企业微信机器人（ADR-0007：markdown）。失败记日志，返回是否成功。"""
+    try:
+        resp = requests.post(
+            WEBHOOK_URL,
+            json={"msgtype": "markdown", "markdown": {"content": content}},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("errcode") != 0:
+            logger.error("企业微信推送失败: HTTP %s %s", resp.status_code, data)
+            return False
+        logger.info("企业微信推送成功（%d 字节）", len(content.encode("utf-8")))
+        return True
+    except Exception as exc:
+        logger.error("企业微信推送异常: %s", exc)
+        return False
+
+
+def extract_feishu_card_title(content: str) -> Tuple[str, str]:
+    """提取首行 '## xxx' 作为飞书卡片标题，返回 (title, body)；无标题时 title 为空。"""
+    lines = content.splitlines()
+    if lines and re.match(r"^##\s+", lines[0]):
+        title = re.sub(r"^##\s+", "", lines[0]).strip()
+        return title, "\n".join(lines[1:]).strip()
+    return "", content.strip()
+
+
+def format_feishu_markdown(content: str) -> str:
+    """把企业微信风格 markdown 转成飞书 lark_md 兼容格式（参考 daily_stock_analysis 简化版）：
+    - '#/##/### 标题' → '**标题**'（lark_md 不支持 # 标题语法）
+    - '- 列表项' → '• 列表项'
+    其余（**加粗**、emoji、换行）lark_md 原生支持。
+    """
+    lines = []
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        if re.match(r"^#{1,6}\s+", line):
+            title = re.sub(r"^#{1,6}\s+", "", line).strip()
+            line = f"**{title}**" if title else ""
+        elif line.startswith("- "):
+            line = f"• {line[2:].strip()}"
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def build_feishu_sign(timestamp: str) -> str:
+    """飞书机器人加签（FEISHU_WEBHOOK_SECRET）：HMAC-SHA256(timestamp\\nsecret) → base64。"""
+    string_to_sign = f"{timestamp}\n{FEISHU_WEBHOOK_SECRET}"
+    return base64.b64encode(
+        hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    ).decode("utf-8")
+
+
+def _feishu_post(payload: dict) -> bool:
+    """POST 飞书 webhook，附加加签字段（若配置了 FEISHU_WEBHOOK_SECRET）。"""
+    body = dict(payload)
+    if FEISHU_WEBHOOK_SECRET:
+        timestamp = str(int(time.time()))
+        body["timestamp"] = timestamp
+        body["sign"] = build_feishu_sign(timestamp)
+    resp = requests.post(FEISHU_WEBHOOK_URL, json=body, timeout=15)
+    data = resp.json()
+    code = data.get("code", data.get("StatusCode"))
+    if code == 0:
+        logger.info("飞书推送成功（%d 字节）", len(str(payload).encode("utf-8")))
+        return True
+    logger.error(
+        "飞书推送失败: HTTP %s code=%s msg=%s",
+        resp.status_code,
+        code,
+        data.get("msg") or data.get("StatusMessage") or "未知错误",
+    )
+    return False
+
+
+def send_feishu_message(content: str) -> bool:
+    """推送单条消息到飞书机器人（ADR-0014）：interactive 卡片（lark_md）优先，text 降级。"""
+    title, body = extract_feishu_card_title(content)
+    card: dict = {
+        "config": {"wide_screen_mode": True},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": format_feishu_markdown(body)}}
+        ],
+    }
+    if title:
+        card["header"] = {"title": {"tag": "plain_text", "content": title}}
+    try:
+        if _feishu_post({"msg_type": "interactive", "card": card}):
+            return True
+        # 降级：纯文本
+        return _feishu_post({"msg_type": "text", "content": {"text": content}})
+    except Exception as exc:
+        logger.error("飞书推送异常: %s", exc)
+        return False
+
+
+def enabled_channels() -> List[Tuple[str, Callable[[str], bool]]]:
+    """已配置的推送渠道列表（ADR-0014：有哪个推哪个，都有都推）。"""
+    channels: List[Tuple[str, Callable[[str], bool]]] = []
+    if WEBHOOK_URL:
+        channels.append(("企业微信", send_wechat_message))
+    if FEISHU_WEBHOOK_URL:
+        channels.append(("飞书", send_feishu_message))
+    return channels
+
+
+def send_messages(contents: List[str]) -> None:
+    """推送消息列表到全部已配置渠道。dry_run 只打印不推送；推送失败记日志（ADR-0005 不重试）。"""
     for content in contents:
+        channels = enabled_channels()
         if DRY_RUN:
-            logger.info("[dry-run] 将推送（%d 字节）：\n%s", len(content.encode("utf-8")), content)
+            names = "、".join(name for name, _ in channels) if channels else "无（未配置任何 webhook）"
+            logger.info("[dry-run] 将推送（%d 字节，渠道: %s）：\n%s", len(content.encode("utf-8")), names, content)
             continue
-        if not WEBHOOK_URL:
-            logger.error("未配置 WECHAT_WEBHOOK_URL，跳过推送")
+        if not channels:
+            logger.error("未配置任何推送渠道（WECHAT_WEBHOOK_URL / FEISHU_WEBHOOK_URL），跳过")
             continue
-        try:
-            resp = requests.post(
-                WEBHOOK_URL,
-                json={"msgtype": "markdown", "markdown": {"content": content}},
-                timeout=15,
-            )
-            data = resp.json()
-            if data.get("errcode") != 0:
-                logger.error("企业微信推送失败: HTTP %s %s", resp.status_code, data)
-            else:
-                logger.info("企业微信推送成功（%d 字节）", len(content.encode("utf-8")))
-        except Exception as exc:
-            logger.error("企业微信推送异常: %s", exc)
+        for name, sender in channels:
+            sender(content)
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +524,8 @@ def run_replay() -> int:
     logger.info("=" * 60)
     logger.info("信号复盘模式启动 | 北京时间 %s", datetime.now(TZ_CN))
     logger.info("dry_run=%s 显式日期=%s", DRY_RUN, REPLAY_DATE or "(自动)")
-    if not WEBHOOK_URL and not DRY_RUN:
-        logger.error("未配置 WECHAT_WEBHOOK_URL（GitHub Secrets），且非 dry-run，无法推送")
+    if not WEBHOOK_URL and not FEISHU_WEBHOOK_URL and not DRY_RUN:
+        logger.error("未配置 WECHAT_WEBHOOK_URL / FEISHU_WEBHOOK_URL（GitHub Secrets），且非 dry-run，无法推送")
         return 1
 
     alarms: List[str] = []
@@ -461,7 +566,7 @@ def run_replay() -> int:
     klines, failed_codes = fetch_all_klines(codes)
     if not klines:
         alarms.append(f"本轮全部股票抓取失败（{len(codes)} 只），数据源可能故障")
-        send_wechat_messages([alarm_message(alarms)])
+        send_messages([alarm_message(alarms)])
         return 0
 
     # 4. 逐根回放目标日（ADR-0013：只用目标日及之前的数据，不用未来数据）
@@ -488,7 +593,7 @@ def run_replay() -> int:
         alarms.append(
             f"目标日 {target} 无任何股票的K线数据（可能超出近 5 个交易日保留范围，ADR-0004）"
         )
-        send_wechat_messages([alarm_message(alarms)])
+        send_messages([alarm_message(alarms)])
         return 0
     if missing_day_codes:
         logger.warning("以下股票目标日无数据，跳过（ADR-0008 静默）: %s", ", ".join(missing_day_codes))
@@ -503,7 +608,7 @@ def run_replay() -> int:
             contents[-1] = merged
         else:
             contents.append(alarm_text)
-    send_wechat_messages(contents)
+    send_messages(contents)
     return 0
 
 
@@ -526,8 +631,8 @@ def main() -> int:
     logger.info("=" * 60)
     logger.info("A股 15分钟K线 MA%d 上穿监控启动 | 北京时间 %s", MA_PERIOD, now)
     logger.info("dry_run=%s force_run=%s 自选股=%s", DRY_RUN, FORCE_RUN, STOCK_LIST_RAW or "(未配置)")
-    if not WEBHOOK_URL and not DRY_RUN:
-        logger.error("未配置 WECHAT_WEBHOOK_URL（GitHub Secrets），且非 dry-run，本轮无法推送")
+    if not WEBHOOK_URL and not FEISHU_WEBHOOK_URL and not DRY_RUN:
+        logger.error("未配置 WECHAT_WEBHOOK_URL / FEISHU_WEBHOOK_URL（GitHub Secrets），且非 dry-run，无法推送")
         return 1
 
     alarms: List[str] = []
@@ -561,7 +666,7 @@ def main() -> int:
     klines, failed_codes = fetch_all_klines(codes)
     if not klines:
         alarms.append(f"本轮全部股票抓取失败（{len(codes)} 只），数据源可能故障")
-        send_wechat_messages([alarm_message(alarms)])
+        send_messages([alarm_message(alarms)])
         return 0
 
     # 5. 护栏：最新已收盘K线日期与新鲜度（ADR-0006 修订版，保证 15:03 轮不被误杀）
@@ -588,7 +693,7 @@ def main() -> int:
             f"严重延迟：最新已收盘K线 {latest:%H:%M} 已收盘 {age_minutes:.0f} 分钟"
             f"（> {STALE_THRESHOLD_MINUTES} 分钟），本轮跳过"
         )
-        send_wechat_messages([alarm_message(alarms)])
+        send_messages([alarm_message(alarms)])
         return 0
     logger.info("最新已收盘K线: %s（距今 %.0f 分钟），正常处理", latest, age_minutes)
 
@@ -631,7 +736,7 @@ def main() -> int:
         else:
             contents.append(alarm_text)
 
-    send_wechat_messages(contents)
+    send_messages(contents)
     return 0
 
 

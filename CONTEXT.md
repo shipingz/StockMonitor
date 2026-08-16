@@ -4,7 +4,7 @@
 
 ## 项目定位
 
-在 GitHub Actions 上定时运行，用 AKShare 抓取 A 股数据，检测「15分钟K线收盘价超过 MA60」的信号，通过企业微信群机器人 Webhook 推送通知。
+在 GitHub Actions 上定时运行，用 AKShare 抓取 A 股数据，检测「15分钟K线收盘价超过 MA60」的信号，通过企业微信群机器人和/或飞书群机器人 Webhook 推送通知（有哪个推哪个，ADR-0014）。
 
 ## 术语表
 
@@ -17,6 +17,7 @@
 | **上穿（cross above）** | 当前K线收盘价 > MA60（含当前K线），且上一根K线收盘价 ≤ 上一时刻的 MA60（前 60 根，不含当前K线）；实现见 ADR-0002。 |
 | **自选股列表** | 项目监控的股票集合，存放在 GitHub Repository variables `STOCK_LIST`（逗号分隔纯 6 位代码），上限 50 只（ADR-0001/0009）。 |
 | **企业微信 Webhook** | 企业微信群机器人提供的 HTTP 推送接口，向群内发送 text/markdown 消息。Webhook URL 属机密，存于 GitHub Secrets。 |
+| **飞书 Webhook** | 飞书群自定义机器人提供的 HTTP 推送接口，支持 interactive 卡片（lark_md 渲染）与 text。Webhook URL 属机密，存于 GitHub Secrets；可选「加签」密钥 `FEISHU_WEBHOOK_SECRET`。 |
 | **GitHub Actions cron** | GitHub Actions 的定时调度（`schedule` 事件），最小粒度 5 分钟，实际触发有 30~60 秒延迟，时区为 UTC。 |
 | **AKShare** | 开源 Python 金融数据接口库，本项目的数据源封装层。 |
 | **交易时段调度** | 只在交易日（周一至周五、非节假日）的 A股交易时段内运行检查；节假日需用交易日历剔除。 |
@@ -39,6 +40,7 @@
 | ADR-0011 | 抓取容错：照抄参考项目——串行 + 随机2~5s限速 + 指数退避重试 3 次尝试 | 已确认 |
 | ADR-0012 | 手动触发与测试：workflow_dispatch + dry-run（不推送）；Python 3.11 + requirements.txt 照抄参考项目 | 已确认 |
 | ADR-0013 | 复盘模式：replay flag 回放最近完整交易日全部信号；复用实时判定逻辑；消息去偏离 | 已确认 |
+| ADR-0014 | 多渠道推送：企业微信 + 飞书（interactive 卡片/lark_md + text 降级 + 可选加签）；有哪个推哪个 | 已确认 |
 
 ## 事实约束（已查证）
 
@@ -46,4 +48,5 @@
 - **仓库 60 天无 activity 时，GitHub 自动禁用 scheduled workflows**（本项目不做 keepalive，用户每日查看运行结果，接受风险）。
 - AKShare `stock_zh_a_hist_min_em`（东方财富源）分钟数据仅保留最近约 5 个交易日；高频密集调用会出现 HTTP 429，需指数退避重试。判定上穿需 ≥61 根历史K线（60 根算 MA + 1 根作上一根对比，ADR-0002/0004）。
 - 企业微信机器人 Webhook 限制：每分钟最多 20 条消息；单条 text 消息 ≤2048 字节、markdown ≤4096 字节。
+- 飞书自定义机器人 Webhook 限制：每分钟最多 100 条消息；支持 interactive 卡片（lark_md 不支持 `#` 标题语法，需转换）与 text；可选加签（HMAC-SHA256）。
 - A股每个交易日有 16 根 15 分钟K线。

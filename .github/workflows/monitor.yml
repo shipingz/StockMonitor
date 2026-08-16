@@ -74,8 +74,10 @@ jobs:
 
       - name: 执行监控
         env:
-          # 机密走 Secrets（ADR-0009）
+          # 机密走 Secrets（ADR-0009）；推送渠道有哪个推哪个（ADR-0014）
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
           # 配置走 Variables（兼容 Secrets，三段式）
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
