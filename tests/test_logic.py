@@ -5,6 +5,7 @@
 """
 
 import sys
+import time as time_mod
 import unittest
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -372,6 +373,66 @@ class TestSinaParsers(unittest.TestCase):
         self.assertIsNone(parse_sina_kline_jsonp(""))
         self.assertIsNone(parse_sina_kline_jsonp("var _data=null;"))
         self.assertIsNone(parse_sina_kline_jsonp("not json at all"))
+
+
+class TestFetchConcurrency(unittest.TestCase):
+    """ADR-0011 修订：fetch_all_klines 并发抓取（默认 FETCH_WORKERS=3）。"""
+
+    def test_parallel_fetch_speedup(self):
+        import main as m
+
+        orig_fetch = m.fetch_15min_kline
+        orig_rate = m.enforce_rate_limit
+        orig_workers = m.FETCH_WORKERS
+        m.enforce_rate_limit = lambda: None  # 禁用限速，纯测并发
+        m.FETCH_WORKERS = 4
+        calls: list = []
+
+        def fake_fetch(code: str):
+            calls.append(code)
+            time_mod.sleep(0.15)  # 每只模拟 150ms
+            return pd.DataFrame({"时间": pd.to_datetime(["2026-08-14 15:00:00"]), "收盘": [1.0]})
+
+        m.fetch_15min_kline = fake_fetch
+        try:
+            t0 = time_mod.time()
+            klines, failed = m.fetch_all_klines(["600519", "000001", "300750", "000725", "600183", "605499"])
+            elapsed = time_mod.time() - t0
+        finally:
+            m.fetch_15min_kline = orig_fetch
+            m.enforce_rate_limit = orig_rate
+            m.FETCH_WORKERS = orig_workers
+
+        self.assertEqual(len(klines), 6)
+        self.assertEqual(failed, [])
+        self.assertLess(elapsed, 0.45)  # 串行 6×0.15=0.9s；4 线程应显著更快
+
+    def test_serial_when_workers_1(self):
+        import main as m
+
+        orig_fetch = m.fetch_15min_kline
+        orig_rate = m.enforce_rate_limit
+        orig_workers = m.FETCH_WORKERS
+        m.enforce_rate_limit = lambda: None
+        m.FETCH_WORKERS = 1
+        calls: list = []
+
+        def fake_fetch(code: str):
+            calls.append(code)
+            time_mod.sleep(0.05)
+            return pd.DataFrame({"时间": pd.to_datetime(["2026-08-14 15:00:00"]), "收盘": [1.0]})
+
+        m.fetch_15min_kline = fake_fetch
+        try:
+            klines, failed = m.fetch_all_klines(["600519", "000001", "300750"])
+        finally:
+            m.fetch_15min_kline = orig_fetch
+            m.enforce_rate_limit = orig_rate
+            m.FETCH_WORKERS = orig_workers
+
+        self.assertEqual(len(klines), 3)
+        self.assertEqual(failed, [])
+        self.assertEqual(calls, ["600519", "000001", "300750"])  # 串行有序
 
 
 if __name__ == "__main__":

@@ -21,7 +21,9 @@ import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -59,6 +61,11 @@ MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "50"))
 SLEEP_MIN = float(os.environ.get("FETCH_SLEEP_MIN", "2.0"))
 SLEEP_MAX = float(os.environ.get("FETCH_SLEEP_MAX", "5.0"))
 FETCH_ATTEMPTS = int(os.environ.get("FETCH_ATTEMPTS", "3"))
+
+# 抓取并发线程数（ADR-0011 修订）：串行对 50 只需 3~5 分钟，实时价模式（ADR-0016）下不够。
+# 安全优先：每线程独立限速（threading.local），总 QPS ≈ workers/3.5s；默认 3（总 QPS ~1.5，
+# 新浪源实测远高于此承受力；东财仅兜底路径出现）。设 1 即回到纯串行。范围 1~8。
+FETCH_WORKERS = max(1, min(8, int(os.environ.get("FETCH_WORKERS", "3"))))
 
 # K线数据源优先级（ADR-0015 修订）：GitHub runner 上东财 IP 被封是确定性事实（nid 403 + 直连断连），
 # 故默认新浪优先（实测稳定、200 根/次、无风控），东财降级为兜底。可设 KLINE_SOURCE_PRIORITY=sina,em 调整。
@@ -114,10 +121,12 @@ def setup_logging() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AKShare 数据抓取（ADR-0011：串行 + 随机限速 + 指数退避重试）
+# AKShare 数据抓取（ADR-0011：并发 + 每线程随机限速 + 指数退避重试）
 # ---------------------------------------------------------------------------
 
-_last_request_time: Optional[float] = None
+# 每线程独立的限速状态：并发下各线程各自保持请求节奏（threading.local），
+# 总 QPS ≈ FETCH_WORKERS / 平均限速间隔，由线程数控制（ADR-0011 修订）。
+_thread_local = threading.local()
 
 # 东方财富反爬补丁（ADR-0015）：云服务器 IP（GitHub Actions runner）直连东财会被风控断连
 # （RemoteDisconnected），需先向 anonflow2.eastmoney.com 换取 nid 令牌，抓取时携带
@@ -148,68 +157,71 @@ def random_user_agent() -> str:
 
 
 _nid_cache: Dict[str, object] = {"data": None, "expire_at": 0.0}
+_nid_lock = threading.Lock()
 
 
 def _get_eastmoney_nid(user_agent: str) -> Optional[str]:
     """向 anonflow2.eastmoney.com 换取 nid 授权令牌（带 20s 成功缓存 / 5min 失败缓存）。
 
     失败时也缓存（data=None），避免 403 后每只股票每次尝试都重复请求被风控的接口。
+    加锁：并发抓取（ADR-0011 修订）下仅首个线程请求令牌，其余线程等锁后命中缓存。
     """
     now = time.time()
-    if now < _nid_cache["expire_at"]:
-        return _nid_cache["data"]  # type: ignore[return-value]
-    try:
-        import hashlib
-        import secrets as secrets_mod
-        import uuid as uuid_mod
+    with _nid_lock:
+        if now < _nid_cache["expire_at"]:
+            return _nid_cache["data"]  # type: ignore[return-value]
+        try:
+            import hashlib
+            import secrets as secrets_mod
+            import uuid as uuid_mod
 
-        def _uuid_md5() -> str:
-            return hashlib.md5(str(uuid_mod.uuid4()).encode("utf-8")).hexdigest()
+            def _uuid_md5() -> str:
+                return hashlib.md5(str(uuid_mod.uuid4()).encode("utf-8")).hexdigest()
 
-        def _st_nvi() -> str:
-            charset = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict"
-            random_str = "".join(secrets_mod.choice(charset) for _ in range(21))
-            return random_str + hashlib.sha256(random_str.encode("utf-8")).hexdigest()[:4]
+            def _st_nvi() -> str:
+                charset = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict"
+                random_str = "".join(secrets_mod.choice(charset) for _ in range(21))
+                return random_str + hashlib.sha256(random_str.encode("utf-8")).hexdigest()[:4]
 
-        url = "https://anonflow2.eastmoney.com/backend/api/webreport"
-        payload = json.dumps(
-            {
-                "osPlatform": "Windows",
-                "sourceType": "WEB",
-                "osversion": "Windows 10.0",
-                "language": "zh-CN",
-                "timezone": "Asia/Shanghai",
-                "webDeviceInfo": {
-                    "screenResolution": random.choice(("1920X1080", "2560X1440", "3840X2160")),
-                    "userAgent": user_agent,
-                    "canvasKey": _uuid_md5(),
-                    "webglKey": _uuid_md5(),
-                    "fontKey": _uuid_md5(),
-                    "audioKey": _uuid_md5(),
-                },
+            url = "https://anonflow2.eastmoney.com/backend/api/webreport"
+            payload = json.dumps(
+                {
+                    "osPlatform": "Windows",
+                    "sourceType": "WEB",
+                    "osversion": "Windows 10.0",
+                    "language": "zh-CN",
+                    "timezone": "Asia/Shanghai",
+                    "webDeviceInfo": {
+                        "screenResolution": random.choice(("1920X1080", "2560X1440", "3840X2160")),
+                        "userAgent": user_agent,
+                        "canvasKey": _uuid_md5(),
+                        "webglKey": _uuid_md5(),
+                        "fontKey": _uuid_md5(),
+                        "audioKey": _uuid_md5(),
+                    },
+                }
+            )
+            headers = {
+                "Cookie": f"st_nvi={_st_nvi()}",
+                "Content-Type": "application/json",
+                # 浏览器特征头，降低 anonflow2 对无特征请求的 403 概率（ADR-0015）
+                "Referer": "https://www.eastmoney.com/",
+                "Origin": "https://www.eastmoney.com",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9",
             }
-        )
-        headers = {
-            "Cookie": f"st_nvi={_st_nvi()}",
-            "Content-Type": "application/json",
-            # 浏览器特征头，降低 anonflow2 对无特征请求的 403 概率（ADR-0015）
-            "Referer": "https://www.eastmoney.com/",
-            "Origin": "https://www.eastmoney.com",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-        }
-        resp = requests.post(url, headers=headers, data=payload, timeout=30)
-        resp.raise_for_status()
-        nid = resp.json()["data"]["nid"]
-        _nid_cache["data"] = nid
-        _nid_cache["expire_at"] = now + 20
-        logger.info("东方财富 nid 令牌获取成功")
-        return nid
-    except Exception as exc:
-        logger.warning("东方财富 nid 令牌获取失败（将无令牌直连，可能仍被风控）: %s", exc)
-        _nid_cache["data"] = None
-        _nid_cache["expire_at"] = now + 5 * 60
-        return None
+            resp = requests.post(url, headers=headers, data=payload, timeout=30)
+            resp.raise_for_status()
+            nid = resp.json()["data"]["nid"]
+            _nid_cache["data"] = nid
+            _nid_cache["expire_at"] = now + 20
+            logger.info("东方财富 nid 令牌获取成功")
+            return nid
+        except Exception as exc:
+            logger.warning("东方财富 nid 令牌获取失败（将无令牌直连，可能仍被风控）: %s", exc)
+            _nid_cache["data"] = None
+            _nid_cache["expire_at"] = now + 5 * 60
+            return None
 
 
 _original_session_request = requests.Session.request
@@ -245,15 +257,15 @@ def apply_eastmoney_patch() -> None:
 
 
 def enforce_rate_limit() -> None:
-    """每次请求前强制限速：距上次请求不足 SLEEP_MIN 则补足，再随机 jitter SLEEP_MIN~SLEEP_MAX。"""
-    global _last_request_time
+    """每线程独立限速：距该线程上次请求不足 SLEEP_MIN 则补足，再随机 jitter SLEEP_MIN~SLEEP_MAX。"""
+    last = getattr(_thread_local, "last_request_time", None)
     now_ts = time.time()
-    if _last_request_time is not None:
-        elapsed = now_ts - _last_request_time
+    if last is not None:
+        elapsed = now_ts - last
         if elapsed < SLEEP_MIN:
             time.sleep(SLEEP_MIN - elapsed)
     time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-    _last_request_time = time.time()
+    _thread_local.last_request_time = time.time()
 
 
 def sina_symbol(code: str) -> str:
@@ -702,15 +714,34 @@ def resolve_replay_date(calendar: set, now: datetime) -> Optional[date]:
 
 
 def fetch_all_klines(codes: List[str]) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
-    """串行抓取全部自选股 15 分钟K线（ADR-0011）。返回 (成功 dict, 失败列表)。"""
+    """抓取全部自选股 15 分钟K线（ADR-0011 修订：FETCH_WORKERS 线程并发，默认 3）。
+
+    每线程独立限速（enforce_rate_limit 用 threading.local），总 QPS 由线程数控制；
+    FETCH_WORKERS=1 时退化为纯串行。返回 (成功 dict, 失败列表)。
+    """
     klines: Dict[str, pd.DataFrame] = {}
     failed_codes: List[str] = []
-    for code in codes:
-        df = fetch_15min_kline(code)
-        if df is None:
-            failed_codes.append(code)
-        else:
-            klines[code] = df
+    if FETCH_WORKERS <= 1 or len(codes) <= 1:
+        for code in codes:
+            df = fetch_15min_kline(code)
+            if df is None:
+                failed_codes.append(code)
+            else:
+                klines[code] = df
+    else:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+            future_map = {executor.submit(fetch_15min_kline, code): code for code in codes}
+            for future in as_completed(future_map):
+                code = future_map[future]
+                try:
+                    df = future.result()
+                except Exception as exc:
+                    logger.error("%s 抓取线程异常: %s", code, exc)
+                    df = None
+                if df is None:
+                    failed_codes.append(code)
+                else:
+                    klines[code] = df
     if failed_codes:
         logger.warning("单股抓取失败（ADR-0008 静默跳过）: %s", ", ".join(failed_codes))
     return klines, failed_codes
