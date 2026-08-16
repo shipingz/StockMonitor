@@ -1,6 +1,6 @@
 # ADR-0015: 东方财富反爬补丁 + 新浪降级源
 
-- 状态：**已确认（2026-08-15 修订：新增新浪降级源，解决 anonflow2 403）**
+- 状态：**已确认（2026-08-15 修订 2：GitHub runner 上东财确认被封，K线主源改为新浪优先）**
 - 日期：2026-08-15（部署后修复，讨论确认）
 
 ## 背景
@@ -25,7 +25,9 @@
    - anonflow2 换令牌请求带浏览器特征头（Referer/Origin/Accept/Accept-Language）降低 403 概率。
 2. **名称表主源改新浪批量**（2026-08-15 修订）：`fetch_name_map(codes)` 优先用 `hq.sinajs.cn/list=sh600519,...` **一次请求查全部自选股名称**（GBK 解码；参考项目同款），避免东财全市场分页（akshare 内部 tqdm 17 页，慢且触发风控）；新浪失败才 fallback 东财 `stock_info_a_code_name`（重试 `FETCH_ATTEMPTS` 次，指数退避）。
 3. **K 线主源东财 + 新浪降级**（2026-08-15 修订）：`fetch_15min_kline` 东财（带补丁+重试）失败后自动切**新浪直连** `quotes.sina.cn/cn/api/jsonp_v2.php/.../CN_MarketDataService.getKLineData?symbol=sh600519&scale=15&datalen=200`（返回近 200 根 15 分钟K线 ≈ 12.5 交易日，足够 61 根门槛），解析 JSONP 为 时间/收盘 两列；新浪源同样带重试。
-4. 限速叠加说明：补丁随机休眠 1~4s + 原有 `enforce_rate_limit` 2~5s → 每请求约 3~9s，50 只单轮约 3~7.5 分钟，仍在 15 分钟K线窗口内（ADR-0011）。
+3. **K 线数据源优先级**（修订 2）：`KLINE_SOURCE_PRIORITY`（默认 `sina,em`）——**新浪优先、东财兜底**。实测确认 GitHub runner 上东财被彻底封死（anonflow2 403 + push2his 直连断连，重试无意义），新浪一次请求 200 根稳定返回；东财补丁保留作为兜底（若未来 IP 解封或方案更新可设 `KLINE_SOURCE_PRIORITY=em,sina` 换回）。
+4. **nid 失败缓存修复**（修订 2）：`_get_eastmoney_nid` 失败也写缓存（5 分钟），避免每只股票每次尝试重复请求被风控的 anonflow2 接口（原实现失败缓存永不命中）。
+5. 限速叠加说明：补丁随机休眠 1~4s + 原有 `enforce_rate_limit` 2~5s → 每请求约 3~9s，50 只单轮约 3~7.5 分钟，仍在 15 分钟K线窗口内（ADR-0011）。新浪主源下每轮仅 50 次请求，实际更快。
 
 ## 后果
 

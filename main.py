@@ -60,6 +60,10 @@ SLEEP_MIN = float(os.environ.get("FETCH_SLEEP_MIN", "2.0"))
 SLEEP_MAX = float(os.environ.get("FETCH_SLEEP_MAX", "5.0"))
 FETCH_ATTEMPTS = int(os.environ.get("FETCH_ATTEMPTS", "3"))
 
+# K线数据源优先级（ADR-0015 修订）：GitHub runner 上东财 IP 被封是确定性事实（nid 403 + 直连断连），
+# 故默认新浪优先（实测稳定、200 根/次、无风控），东财降级为兜底。可设 KLINE_SOURCE_PRIORITY=sina,em 调整。
+KLINE_SOURCE_PRIORITY = os.environ.get("KLINE_SOURCE_PRIORITY", "sina,em").strip().lower()
+
 # 企业微信 markdown 消息安全阈值（上限 4096 字节，留余量，ADR-0007）
 MSG_SAFE_BYTES = int(os.environ.get("MSG_SAFE_BYTES", "3800"))
 
@@ -147,9 +151,12 @@ _nid_cache: Dict[str, object] = {"data": None, "expire_at": 0.0}
 
 
 def _get_eastmoney_nid(user_agent: str) -> Optional[str]:
-    """向 anonflow2.eastmoney.com 换取 nid 授权令牌（带 20s 缓存）。失败返回 None（尽力而为）。"""
+    """向 anonflow2.eastmoney.com 换取 nid 授权令牌（带 20s 成功缓存 / 5min 失败缓存）。
+
+    失败时也缓存（data=None），避免 403 后每只股票每次尝试都重复请求被风控的接口。
+    """
     now = time.time()
-    if _nid_cache["data"] and now < _nid_cache["expire_at"]:
+    if now < _nid_cache["expire_at"]:
         return _nid_cache["data"]  # type: ignore[return-value]
     try:
         import hashlib
@@ -415,12 +422,26 @@ def fetch_15min_kline_sina(symbol: str) -> Optional[pd.DataFrame]:
 
 
 def fetch_15min_kline(symbol: str) -> Optional[pd.DataFrame]:
-    """抓取单只股票 15 分钟K线：东财主源（带重试），失败后自动切新浪直连源（ADR-0015）。"""
-    df = _fetch_15min_kline_em(symbol)
-    if df is not None:
-        return df
-    logger.warning("%s 东财源失败，切换新浪源", symbol)
-    return fetch_15min_kline_sina(symbol)
+    """抓取单只股票 15 分钟K线，按 KLINE_SOURCE_PRIORITY 顺序尝试数据源（ADR-0015）。
+
+    默认 'sina,em'：新浪优先（GitHub runner 上东财被封是确定性事实），东财兜底。
+    """
+    sources = {
+        "sina": ("新浪", fetch_15min_kline_sina),
+        "em": ("东财", _fetch_15min_kline_em),
+    }
+    order = [s.strip() for s in KLINE_SOURCE_PRIORITY.split(",") if s.strip() in sources]
+    if not order:  # 非法配置兜底
+        order = ["sina", "em"]
+    for idx, name in enumerate(order):
+        source_name, fetcher = sources[name]
+        logger.info("尝试 %s 源抓取 %s（优先级 %d/%d）", source_name, symbol, idx + 1, len(order))
+        df = fetcher(symbol)
+        if df is not None:
+            return df
+        if idx < len(order) - 1:
+            logger.warning("%s 源抓取 %s 失败，切换下一数据源", source_name, symbol)
+    return None
 
 
 # ---------------------------------------------------------------------------
