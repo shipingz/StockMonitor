@@ -185,6 +185,11 @@ def _get_eastmoney_nid(user_agent: str) -> Optional[str]:
         headers = {
             "Cookie": f"st_nvi={_st_nvi()}",
             "Content-Type": "application/json",
+            # 浏览器特征头，降低 anonflow2 对无特征请求的 403 概率（ADR-0015）
+            "Referer": "https://www.eastmoney.com/",
+            "Origin": "https://www.eastmoney.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
         }
         resp = requests.post(url, headers=headers, data=payload, timeout=30)
         resp.raise_for_status()
@@ -244,6 +249,44 @@ def enforce_rate_limit() -> None:
     _last_request_time = time.time()
 
 
+def sina_symbol(code: str) -> str:
+    """6 位代码 → 新浪符号：6 开头为沪市（sh），其余为深市（sz）。北交所不在支持范围（ADR-0001）。"""
+    return f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+
+def parse_sina_name_response(text: str) -> Dict[str, str]:
+    """解析 hq.sinajs.cn 响应（已按 GBK 解码）：'var hq_str_sh600519=\"贵州茅台,...\";' → {code: name}。"""
+    result: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        m = re.match(r'var hq_str_(?:sh|sz)(\d{6})="([^,]*),', line)
+        if m and m.group(2).strip():
+            result[m.group(1)] = m.group(2).strip()
+    return result
+
+
+def parse_sina_kline_jsonp(text: str) -> Optional[pd.DataFrame]:
+    """解析新浪分钟K线 JSONP：'var _data=[{\"day\":\"2026-08-14 10:00:00\",\"close\":\"1700.00\",...},...];'
+    返回 时间/收盘 两列（时间升序）。解析失败返回 None。
+    """
+    m = re.search(r"\[.*\]", text or "", re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not data:
+        return None
+    rows = [{"时间": item.get("day"), "收盘": item.get("close")} for item in data]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return None
+    df["时间"] = pd.to_datetime(df["时间"], errors="coerce")
+    df["收盘"] = pd.to_numeric(df["收盘"], errors="coerce")
+    df = df.dropna(subset=["时间", "收盘"]).sort_values("时间")
+    return df if not df.empty else None
+
+
 def fetch_trade_calendar() -> Optional[set]:
     """全年交易日集合（date）。失败返回 None → 调用方按 ADR-0008 处理。"""
     try:
@@ -256,11 +299,31 @@ def fetch_trade_calendar() -> Optional[set]:
         return None
 
 
-def fetch_name_map() -> Dict[str, str]:
-    """全市场 代码→名称 映射（1 次请求，ADR-0001；ADR-0015：加重试）。
+def fetch_name_map(codes: List[str]) -> Dict[str, str]:
+    """自选股 代码→名称 映射（ADR-0001/0015）。
 
-    重试 FETCH_ATTEMPTS 次（指数退避）。最终失败返回空 dict，名称退化为代码。
+    主用新浪批量接口（hq.sinajs.cn，一次请求查全部自选股，稳定且无全市场分页）；
+    失败时 fallback 东财 stock_info_a_code_name（重试 FETCH_ATTEMPTS 次）。
+    全部失败返回空 dict，名称退化为代码。
     """
+    # 1) 新浪批量（只查自选股，一次请求）
+    try:
+        symbols = ",".join(sina_symbol(c) for c in codes)
+        resp = requests.get(
+            f"https://hq.sinajs.cn/list={symbols}",
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=15,
+        )
+        resp.encoding = "gbk"
+        name_map = parse_sina_name_response(resp.text)
+        if name_map:
+            logger.info("名称映射：新浪批量接口成功（%d/%d 只）", len(name_map), len(codes))
+            return name_map
+        logger.warning("新浪名称接口返回为空（HTTP %s），尝试东财 fallback", resp.status_code)
+    except Exception as exc:
+        logger.warning("新浪名称接口异常: %s，尝试东财 fallback", exc)
+
+    # 2) 东财全市场（带重试；akshare 内部 tqdm 分页，仅 fallback 时触发）
     import akshare as ak
 
     last_exc: Optional[Exception] = None
@@ -270,12 +333,13 @@ def fetch_name_map() -> Dict[str, str]:
             df = ak.stock_info_a_code_name()
             if df is None or df.empty:
                 raise RuntimeError("返回空数据")
-            return {str(row["code"]): str(row["name"]) for _, row in df.iterrows()}
+            full = {str(row["code"]): str(row["name"]) for _, row in df.iterrows()}
+            return {c: full[c] for c in codes if c in full}
         except Exception as exc:
             last_exc = exc
             wait = min(2**attempt, 30)
             logger.warning(
-                "代码名称表获取失败（尝试 %d/%d）: %s，%d 秒后重试",
+                "东财代码名称表获取失败（尝试 %d/%d）: %s，%d 秒后重试",
                 attempt, FETCH_ATTEMPTS, exc, wait,
             )
             if attempt < FETCH_ATTEMPTS:
@@ -284,8 +348,8 @@ def fetch_name_map() -> Dict[str, str]:
     return {}
 
 
-def fetch_15min_kline(symbol: str) -> Optional[pd.DataFrame]:
-    """抓取单只股票 15 分钟K线（ADR-0011：最多 FETCH_ATTEMPTS 次，指数退避 min(2**attempt, 30)）。"""
+def _fetch_15min_kline_em(symbol: str) -> Optional[pd.DataFrame]:
+    """东财源 15 分钟K线（ADR-0011：最多 FETCH_ATTEMPTS 次，指数退避 min(2**attempt, 30)）。"""
     import akshare as ak
 
     last_exc: Optional[Exception] = None
@@ -313,6 +377,50 @@ def fetch_15min_kline(symbol: str) -> Optional[pd.DataFrame]:
                 time.sleep(wait)
     logger.error("抓取 %s 15分钟K线最终失败: %s", symbol, last_exc)
     return None
+
+
+def fetch_15min_kline_sina(symbol: str) -> Optional[pd.DataFrame]:
+    """新浪源 15 分钟K线直连（ADR-0015 fallback）：quotes.sina.cn getKLineData，datalen=200。
+    返回 时间/收盘 两列。失败返回 None。
+    """
+    url = (
+        "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_data=/CN_MarketDataService.getKLineData"
+        f"?symbol={sina_symbol(symbol)}&scale=15&ma=no&datalen=200"
+    )
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            enforce_rate_limit()
+            resp = requests.get(
+                url,
+                headers={"Referer": "https://finance.sina.com.cn"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            df = parse_sina_kline_jsonp(resp.text)
+            if df is None:
+                raise RuntimeError("解析为空")
+            return df
+        except Exception as exc:
+            last_exc = exc
+            wait = min(2**attempt, 30)
+            logger.warning(
+                "新浪 %s 15分钟K线失败（尝试 %d/%d）: %s，%d 秒后重试",
+                symbol, attempt, FETCH_ATTEMPTS, exc, wait,
+            )
+            if attempt < FETCH_ATTEMPTS:
+                time.sleep(wait)
+    logger.error("新浪 %s 15分钟K线最终失败: %s", symbol, last_exc)
+    return None
+
+
+def fetch_15min_kline(symbol: str) -> Optional[pd.DataFrame]:
+    """抓取单只股票 15 分钟K线：东财主源（带重试），失败后自动切新浪直连源（ADR-0015）。"""
+    df = _fetch_15min_kline_em(symbol)
+    if df is not None:
+        return df
+    logger.warning("%s 东财源失败，切换新浪源", symbol)
+    return fetch_15min_kline_sina(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +798,7 @@ def run_replay() -> int:
         return 1
     if len(codes) > MAX_STOCKS:
         alarms.append(f"自选股数量 {len(codes)} 超过上限 {MAX_STOCKS}，继续全量处理")
-    name_map = fetch_name_map()
+    name_map = fetch_name_map(codes)
     missing_codes = [c for c in codes if c not in name_map]
     if missing_codes:
         alarms.append(f"代码表中未找到：{', '.join(missing_codes)}（名称将显示为代码）")
@@ -791,7 +899,7 @@ def main() -> int:
         alarms.append(f"自选股数量 {len(codes)} 超过上限 {MAX_STOCKS}，继续全量处理")
 
     # 3. 名称映射（ADR-0001：查不到的代码告警，名称退化为代码）
-    name_map = fetch_name_map()
+    name_map = fetch_name_map(codes)
     missing_codes = [c for c in codes if c not in name_map]
     if missing_codes:
         alarms.append(f"代码表中未找到：{', '.join(missing_codes)}（名称将显示为代码）")

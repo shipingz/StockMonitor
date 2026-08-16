@@ -24,10 +24,13 @@ from main import (  # noqa: E402
     is_eastmoney_target,
     pack_signal_messages,
     parse_replay_date,
+    parse_sina_kline_jsonp,
+    parse_sina_name_response,
     parse_stock_list,
     random_user_agent,
     replay_signals_for_stock,
     resolve_replay_date,
+    sina_symbol,
 )
 
 TZ_CN = ZoneInfo("Asia/Shanghai")
@@ -332,6 +335,43 @@ class TestEastmoneyPatch(unittest.TestCase):
         uas = {random_user_agent() for _ in range(50)}
         self.assertGreater(len(uas), 1)  # 从内置池随机
         self.assertTrue(all(ua.startswith("Mozilla/5.0") for ua in uas))
+
+
+class TestSinaParsers(unittest.TestCase):
+    """ADR-0015 新浪源：符号转换、名称响应、分钟K线 JSONP 解析。"""
+
+    def test_sina_symbol(self):
+        self.assertEqual(sina_symbol("600519"), "sh600519")
+        self.assertEqual(sina_symbol("688981"), "sh688981")
+        self.assertEqual(sina_symbol("000001"), "sz000001")
+        self.assertEqual(sina_symbol("300750"), "sz300750")
+
+    def test_parse_sina_name_response(self):
+        text = (
+            'var hq_str_sh600519="贵州茅台,1700.00,1699.00,1710.00";\n'
+            'var hq_str_sz000001="平安银行,11.00,10.90,11.10";\n'
+            'var hq_str_sh600999="";\n'
+        )
+        result = parse_sina_name_response(text)
+        self.assertEqual(result, {"600519": "贵州茅台", "000001": "平安银行"})  # 空名称行跳过
+
+    def test_parse_sina_kline_jsonp(self):
+        text = (
+            'var _data=[{"day":"2026-08-14 09:45:00","open":"10.0","high":"10.2",'
+            '"low":"9.9","close":"10.1","volume":"1234"},'
+            '{"day":"2026-08-14 10:00:00","open":"10.1","high":"10.5",'
+            '"low":"10.0","close":"10.4","volume":"5678"}];'
+        )
+        df = parse_sina_kline_jsonp(text)
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df["收盘"].tolist(), [10.1, 10.4])
+        self.assertEqual(df["时间"].iloc[0].strftime("%Y-%m-%d %H:%M"), "2026-08-14 09:45")
+
+    def test_parse_sina_kline_jsonp_invalid(self):
+        self.assertIsNone(parse_sina_kline_jsonp(""))
+        self.assertIsNone(parse_sina_kline_jsonp("var _data=null;"))
+        self.assertIsNone(parse_sina_kline_jsonp("not json at all"))
 
 
 if __name__ == "__main__":
