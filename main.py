@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import os
 import random
@@ -114,6 +115,122 @@ def setup_logging() -> None:
 
 _last_request_time: Optional[float] = None
 
+# 东方财富反爬补丁（ADR-0015）：云服务器 IP（GitHub Actions runner）直连东财会被风控断连
+# （RemoteDisconnected），需先向 anonflow2.eastmoney.com 换取 nid 令牌，抓取时携带
+# Cookie: nid18=<nid> + 随机浏览器 UA + 随机休眠。移植自参考项目 daily_stock_analysis
+# 的 eastmoney_patch.py，UA 用内置列表替代 fake_useragent（避免额外网络依赖）。
+EASTMONEY_PATCH = os.environ.get("EASTMONEY_PATCH", "1").strip().lower() in ("1", "true", "yes", "on")
+EASTMONEY_TARGET_DOMAINS = (
+    "fund.eastmoney.com",
+    "push2.eastmoney.com",
+    "push2his.eastmoney.com",
+)
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+)
+
+
+def is_eastmoney_target(url: str) -> bool:
+    return any(d in (url or "") for d in EASTMONEY_TARGET_DOMAINS)
+
+
+def random_user_agent() -> str:
+    return random.choice(USER_AGENTS)
+
+
+_nid_cache: Dict[str, object] = {"data": None, "expire_at": 0.0}
+
+
+def _get_eastmoney_nid(user_agent: str) -> Optional[str]:
+    """向 anonflow2.eastmoney.com 换取 nid 授权令牌（带 20s 缓存）。失败返回 None（尽力而为）。"""
+    now = time.time()
+    if _nid_cache["data"] and now < _nid_cache["expire_at"]:
+        return _nid_cache["data"]  # type: ignore[return-value]
+    try:
+        import hashlib
+        import secrets as secrets_mod
+        import uuid as uuid_mod
+
+        def _uuid_md5() -> str:
+            return hashlib.md5(str(uuid_mod.uuid4()).encode("utf-8")).hexdigest()
+
+        def _st_nvi() -> str:
+            charset = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict"
+            random_str = "".join(secrets_mod.choice(charset) for _ in range(21))
+            return random_str + hashlib.sha256(random_str.encode("utf-8")).hexdigest()[:4]
+
+        url = "https://anonflow2.eastmoney.com/backend/api/webreport"
+        payload = json.dumps(
+            {
+                "osPlatform": "Windows",
+                "sourceType": "WEB",
+                "osversion": "Windows 10.0",
+                "language": "zh-CN",
+                "timezone": "Asia/Shanghai",
+                "webDeviceInfo": {
+                    "screenResolution": random.choice(("1920X1080", "2560X1440", "3840X2160")),
+                    "userAgent": user_agent,
+                    "canvasKey": _uuid_md5(),
+                    "webglKey": _uuid_md5(),
+                    "fontKey": _uuid_md5(),
+                    "audioKey": _uuid_md5(),
+                },
+            }
+        )
+        headers = {
+            "Cookie": f"st_nvi={_st_nvi()}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(url, headers=headers, data=payload, timeout=30)
+        resp.raise_for_status()
+        nid = resp.json()["data"]["nid"]
+        _nid_cache["data"] = nid
+        _nid_cache["expire_at"] = now + 20
+        logger.info("东方财富 nid 令牌获取成功")
+        return nid
+    except Exception as exc:
+        logger.warning("东方财富 nid 令牌获取失败（将无令牌直连，可能仍被风控）: %s", exc)
+        _nid_cache["data"] = None
+        _nid_cache["expire_at"] = now + 5 * 60
+        return None
+
+
+_original_session_request = requests.Session.request
+_patch_applied = False
+
+
+def apply_eastmoney_patch() -> None:
+    """全局 monkeypatch requests.Session.request：仅对东财域名附加 UA + nid cookie + 随机休眠。"""
+    global _patch_applied
+    if _patch_applied:
+        return
+    if not EASTMONEY_PATCH:
+        logger.info("EASTMONEY_PATCH=off，跳过东财反爬补丁")
+        _patch_applied = True
+        return
+
+    def patched_request(self, method, url, **kwargs):
+        if not is_eastmoney_target(url):
+            return _original_session_request(self, method, url, **kwargs)
+        user_agent = random_user_agent()
+        headers = dict(kwargs.get("headers") or {})
+        headers["User-Agent"] = user_agent
+        nid = _get_eastmoney_nid(user_agent)
+        if nid:
+            headers["Cookie"] = f"nid18={nid}"
+        kwargs["headers"] = headers
+        time.sleep(random.uniform(1.0, 4.0))  # 随机休眠降低风控概率
+        return _original_session_request(self, method, url, **kwargs)
+
+    requests.Session.request = patched_request  # type: ignore[method-assign]
+    _patch_applied = True
+    logger.info("东方财富反爬补丁已启用（UA + nid18 cookie + 随机休眠）")
+
 
 def enforce_rate_limit() -> None:
     """每次请求前强制限速：距上次请求不足 SLEEP_MIN 则补足，再随机 jitter SLEEP_MIN~SLEEP_MAX。"""
@@ -140,15 +257,31 @@ def fetch_trade_calendar() -> Optional[set]:
 
 
 def fetch_name_map() -> Dict[str, str]:
-    """全市场 代码→名称 映射（1 次请求，ADR-0001）。失败返回空 dict，名称退化为代码。"""
-    try:
-        import akshare as ak
+    """全市场 代码→名称 映射（1 次请求，ADR-0001；ADR-0015：加重试）。
 
-        df = ak.stock_info_a_code_name()
-        return {str(row["code"]): str(row["name"]) for _, row in df.iterrows()}
-    except Exception as exc:
-        logger.warning("代码名称表获取失败，本轮名称将以代码显示: %s", exc)
-        return {}
+    重试 FETCH_ATTEMPTS 次（指数退避）。最终失败返回空 dict，名称退化为代码。
+    """
+    import akshare as ak
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            enforce_rate_limit()
+            df = ak.stock_info_a_code_name()
+            if df is None or df.empty:
+                raise RuntimeError("返回空数据")
+            return {str(row["code"]): str(row["name"]) for _, row in df.iterrows()}
+        except Exception as exc:
+            last_exc = exc
+            wait = min(2**attempt, 30)
+            logger.warning(
+                "代码名称表获取失败（尝试 %d/%d）: %s，%d 秒后重试",
+                attempt, FETCH_ATTEMPTS, exc, wait,
+            )
+            if attempt < FETCH_ATTEMPTS:
+                time.sleep(wait)
+    logger.error("代码名称表获取最终失败: %s", last_exc)
+    return {}
 
 
 def fetch_15min_kline(symbol: str) -> Optional[pd.DataFrame]:
@@ -619,6 +752,7 @@ def run_replay() -> int:
 
 def main() -> int:
     setup_logging()
+    apply_eastmoney_patch()  # ADR-0015：东财反爬补丁（UA + nid18 cookie），GitHub runner 必开
 
     # 复盘模式（ADR-0013）：非交易日用 workflow_dispatch 的 replay flag 触发
     if REPLAY:

@@ -41,12 +41,14 @@
 | ADR-0012 | 手动触发与测试：workflow_dispatch + dry-run（不推送）；Python 3.11 + requirements.txt 照抄参考项目 | 已确认 |
 | ADR-0013 | 复盘模式：replay flag 回放最近完整交易日全部信号；复用实时判定逻辑；消息去偏离 | 已确认 |
 | ADR-0014 | 多渠道推送：企业微信 + 飞书（interactive 卡片/lark_md + text 降级 + 可选加签）；有哪个推哪个 | 已确认 |
+| ADR-0015 | 东财反爬补丁（nid18 令牌 + 随机 UA + 随机休眠，默认开）+ 名称表重试 | 已确认 |
 
 ## 事实约束（已查证）
 
 - GitHub Actions `schedule` cron 最小粒度 5 分钟（可精确到分钟），job 启动有 30~60 秒延迟；**高负载时段（整点）可能延迟数分钟，且 schedule 运行失败无自动重试**。
 - **仓库 60 天无 activity 时，GitHub 自动禁用 scheduled workflows**（本项目不做 keepalive，用户每日查看运行结果，接受风险）。
 - AKShare `stock_zh_a_hist_min_em`（东方财富源）分钟数据仅保留最近约 5 个交易日；高频密集调用会出现 HTTP 429，需指数退避重试。判定上穿需 ≥61 根历史K线（60 根算 MA + 1 根作上一根对比，ADR-0002/0004）。
+- **东方财富对云服务器 IP（GitHub Actions runner）风控断连**，需 nid18 令牌补丁（ADR-0015，默认开启）。
 - 企业微信机器人 Webhook 限制：每分钟最多 20 条消息；单条 text 消息 ≤2048 字节、markdown ≤4096 字节。
 - 飞书自定义机器人 Webhook 限制：每分钟最多 100 条消息；支持 interactive 卡片（lark_md 不支持 `#` 标题语法，需转换）与 text；可选加签（HMAC-SHA256）。
 - A股每个交易日有 16 根 15 分钟K线。

@@ -21,9 +21,11 @@ from main import (  # noqa: E402
     extract_feishu_card_title,
     format_feishu_markdown,
     heartbeat_message,
+    is_eastmoney_target,
     pack_signal_messages,
     parse_replay_date,
     parse_stock_list,
+    random_user_agent,
     replay_signals_for_stock,
     resolve_replay_date,
 )
@@ -312,6 +314,24 @@ class TestFeishuFormatting(unittest.TestCase):
         out = format_feishu_markdown("## ⚠️ 监控异常\n- 严重延迟")
         self.assertNotIn("##", out)
         self.assertIn("**⚠️ 监控异常**", out)
+
+
+class TestEastmoneyPatch(unittest.TestCase):
+    """ADR-0015 东财反爬补丁：域名匹配与 UA 选择（纯函数）。"""
+
+    def test_target_domains_matched(self):
+        self.assertTrue(is_eastmoney_target("https://push2his.eastmoney.com/api/qt/stock/kline/get?x=1"))
+        self.assertTrue(is_eastmoney_target("https://push2.eastmoney.com/api/qt/clist/get"))
+        self.assertTrue(is_eastmoney_target("https://fund.eastmoney.com/data/"))
+        self.assertFalse(is_eastmoney_target("https://finance.sina.com.cn/xxx"))
+        self.assertFalse(is_eastmoney_target("https://open.feishu.cn/open-apis/bot/v2/hook/x"))
+        self.assertFalse(is_eastmoney_target("https://qyapi.weixin.qq.com/cgi-bin/webhook/send"))
+        self.assertFalse(is_eastmoney_target(""))
+
+    def test_random_user_agent_from_pool(self):
+        uas = {random_user_agent() for _ in range(50)}
+        self.assertGreater(len(uas), 1)  # 从内置池随机
+        self.assertTrue(all(ua.startswith("Mozilla/5.0") for ua in uas))
 
 
 if __name__ == "__main__":
