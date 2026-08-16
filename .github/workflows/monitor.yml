@@ -22,6 +22,7 @@ on:
     - cron: '3 7 * * 1-5'      # 北京时间 15:03（收市轮，含 15:00 最后一根K线）
 
   # 手动触发（ADR-0012）：dry_run 只计算不推送；force_run 跳过交易日检查
+  # 复盘模式（ADR-0013）：replay 计算最近一个完整交易日当天全部信号（非交易日验证用）
   workflow_dispatch:
     inputs:
       dry_run:
@@ -34,6 +35,16 @@ on:
         required: false
         default: false
         type: boolean
+      replay:
+        description: '复盘模式：计算最近一个完整交易日当天全部信号（非交易日验证用）'
+        required: false
+        default: false
+        type: boolean
+      replay_date:
+        description: '复盘目标日期 YYYY-MM-DD（留空自动取最近完整交易日）'
+        required: false
+        default: ''
+        type: string
 
 # 防止同一 workflow 并发运行（ADR-0003）
 concurrency:
@@ -69,6 +80,8 @@ jobs:
           STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
           FORCE_RUN: ${{ inputs.force_run || 'false' }}
+          REPLAY: ${{ inputs.replay || 'false' }}
+          REPLAY_DATE: ${{ inputs.replay_date || '' }}
         run: python main.py
 
       - name: 上传日志

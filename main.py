@@ -17,7 +17,7 @@ import os
 import random
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -62,6 +62,12 @@ WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "").strip()
 STOCK_LIST_RAW = os.environ.get("STOCK_LIST", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
 FORCE_RUN = os.environ.get("FORCE_RUN", "").strip().lower() in ("1", "true", "yes", "on")
+# 复盘模式（ADR-0013）：计算最近一个完整交易日当天全部信号，非交易日验证用
+REPLAY = os.environ.get("REPLAY", "").strip().lower() in ("1", "true", "yes", "on")
+REPLAY_DATE = os.environ.get("REPLAY_DATE", "").strip()
+
+# 中文星期
+WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 logger = logging.getLogger("stock-monitor")
 
@@ -234,9 +240,14 @@ def build_signal_block(symbol: str, name: str, kline_time: datetime, sig: dict) 
     )
 
 
-def pack_signal_messages(blocks: List[str], limit: int = MSG_SAFE_BYTES) -> List[str]:
-    """ADR-0007 超限拆分：贪心打包，条数尽量少；按 UTF-8 字节计算。"""
-    header = f"## 📈 MA{MA_PERIOD} 上穿信号（15分钟K线）"
+def pack_signal_messages(
+    blocks: List[str],
+    limit: int = MSG_SAFE_BYTES,
+    header: Optional[str] = None,
+) -> List[str]:
+    """ADR-0007 超限拆分：贪心打包，条数尽量少；按 UTF-8 字节计算。header 可定制（复盘复用）。"""
+    if header is None:
+        header = f"## 📈 MA{MA_PERIOD} 上穿信号（15分钟K线）"
     messages: List[str] = []
     current: List[str] = []
 
@@ -290,12 +301,224 @@ def send_wechat_messages(contents: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 复盘模式（ADR-0013）：非交易日用 flag 触发，回放最近一个完整交易日当天全部信号
+# ---------------------------------------------------------------------------
+
+
+def weekday_cn(d: date) -> str:
+    return WEEKDAY_CN[d.weekday()]
+
+
+def parse_replay_date(raw: str) -> Optional[date]:
+    """解析显式复盘日期 YYYY-MM-DD；空/非法返回 None。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def resolve_replay_date(calendar: set, now: datetime) -> Optional[date]:
+    """ADR-0013 决策点①A：今天是交易日且已收盘（北京时间 >=15:00）→ 回放今天；
+    否则回放今天之前最近的交易日。找不到返回 None。"""
+    today = now.date()
+    if today in calendar and (now.hour, now.minute) >= (15, 0):
+        return today
+    d = today - timedelta(days=1)
+    for _ in range(60):  # 最多往前找 60 天，防死循环
+        if d in calendar:
+            return d
+        d -= timedelta(days=1)
+    return None
+
+
+def fetch_all_klines(codes: List[str]) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+    """串行抓取全部自选股 15 分钟K线（ADR-0011）。返回 (成功 dict, 失败列表)。"""
+    klines: Dict[str, pd.DataFrame] = {}
+    failed_codes: List[str] = []
+    for code in codes:
+        df = fetch_15min_kline(code)
+        if df is None:
+            failed_codes.append(code)
+        else:
+            klines[code] = df
+    if failed_codes:
+        logger.warning("单股抓取失败（ADR-0008 静默跳过）: %s", ", ".join(failed_codes))
+    return klines, failed_codes
+
+
+def replay_signals_for_stock(
+    df: pd.DataFrame, target: date, code: str, name: str
+) -> Tuple[List[dict], List[str]]:
+    """对目标日当天每个收盘时刻逐根判定上穿（只用 t 之前的K线，不用未来数据）。
+
+    返回 (signals, detail_lines)：signals 为命中列表（含 code/name/kline_time/sig），
+    detail_lines 为全天 16 根明细日志（HH:MM close=.. ma=.. cross=Y/N）。
+    目标日无数据 → ([], [])。
+    """
+    df = df.copy()
+    df["时间"] = pd.to_datetime(df["时间"])
+    df = df.sort_values("时间")
+    day_df = df[df["时间"].dt.date == target]
+    if day_df.empty:
+        return [], []
+
+    closes = pd.to_numeric(df["收盘"], errors="coerce")
+    signals: List[dict] = []
+    details: List[str] = []
+    for ts in day_df["时间"]:
+        sub_closes = closes[df["时间"] <= ts].dropna().tolist()
+        sig = compute_ma_signal(sub_closes)
+        if sig is None:
+            details.append(f"{ts:%H:%M} close=--- ma=--- cross=N（历史不足）")
+            continue
+        cross = sig["cross_above"]
+        details.append(
+            f"{ts:%H:%M} close={sig['cur_close']:.2f} ma={sig['cur_ma']:.2f} cross={'Y' if cross else 'N'}"
+        )
+        if cross:
+            signals.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "kline_time": ts.to_pydatetime(),
+                    "sig": sig,
+                }
+            )
+    return signals, details
+
+
+def build_replay_signal_block(symbol: str, name: str, kline_time: datetime, sig: dict) -> str:
+    """复盘消息的单条信号块（ADR-0013：去掉偏离字段）。"""
+    return "\n".join(
+        [
+            f"**{name}（{symbol}）**｜K线 {kline_time:%H:%M}",
+            f"收盘价：{format_price(sig['cur_close'])} ｜ MA{MA_PERIOD}：{format_price(sig['cur_ma'])}",
+            "**上穿信号**：收盘价上穿 MA%d" % MA_PERIOD,
+        ]
+    )
+
+
+def build_replay_message(target: date, checked: int, signals: List[dict]) -> List[str]:
+    """复盘消息：无信号给汇总行；有信号给信号列表（复用贪心拆分）。"""
+    header = f"## 📊 信号复盘：{target:%Y-%m-%d}（{weekday_cn(target)}）"
+    if not signals:
+        return [f"{header}\n\n当日无上穿信号（检查 {checked} 只 × 16 根K线）"]
+    signals = sorted(signals, key=lambda s: s["kline_time"])
+    blocks = [
+        build_replay_signal_block(s["code"], s["name"], s["kline_time"], s["sig"])
+        for s in signals
+    ]
+    return pack_signal_messages(blocks, header=header)
+
+
+def run_replay() -> int:
+    """复盘模式主流程：确定目标日 → 抓取 → 逐根回放 → 推送复盘消息。"""
+    logger.info("=" * 60)
+    logger.info("信号复盘模式启动 | 北京时间 %s", datetime.now(TZ_CN))
+    logger.info("dry_run=%s 显式日期=%s", DRY_RUN, REPLAY_DATE or "(自动)")
+    if not WEBHOOK_URL and not DRY_RUN:
+        logger.error("未配置 WECHAT_WEBHOOK_URL（GitHub Secrets），且非 dry-run，无法推送")
+        return 1
+
+    alarms: List[str] = []
+
+    # 1. 确定目标日（ADR-0013 决策点①）
+    target: Optional[date] = None
+    if REPLAY_DATE:
+        target = parse_replay_date(REPLAY_DATE)
+        if target is None:
+            logger.error("REPLAY_DATE 格式非法（需 YYYY-MM-DD）: %r", REPLAY_DATE)
+            return 1
+        logger.info("使用显式复盘日期: %s（%s）", target, weekday_cn(target))
+    else:
+        calendar = fetch_trade_calendar()
+        if calendar is None:
+            logger.error("交易日历获取失败，无法自动确定复盘目标日，退出（可显式指定 REPLAY_DATE）")
+            return 1
+        now = datetime.now(TZ_CN)
+        target = resolve_replay_date(calendar, now)
+        if target is None:
+            logger.error("无法确定复盘目标日（交易日历中无可用日期），退出")
+            return 1
+        logger.info("自动确定复盘日期: %s（%s）", target, weekday_cn(target))
+
+    # 2. 自选股解析与名称映射（同实时路径）
+    codes = parse_stock_list(STOCK_LIST_RAW)
+    if not codes:
+        logger.error("STOCK_LIST 为空或全部非法，退出")
+        return 1
+    if len(codes) > MAX_STOCKS:
+        alarms.append(f"自选股数量 {len(codes)} 超过上限 {MAX_STOCKS}，继续全量处理")
+    name_map = fetch_name_map()
+    missing_codes = [c for c in codes if c not in name_map]
+    if missing_codes:
+        alarms.append(f"代码表中未找到：{', '.join(missing_codes)}（名称将显示为代码）")
+
+    # 3. 抓取（ADR-0011）
+    klines, failed_codes = fetch_all_klines(codes)
+    if not klines:
+        alarms.append(f"本轮全部股票抓取失败（{len(codes)} 只），数据源可能故障")
+        send_wechat_messages([alarm_message(alarms)])
+        return 0
+
+    # 4. 逐根回放目标日（ADR-0013：只用目标日及之前的数据，不用未来数据）
+    now_naive = datetime.now(TZ_CN).replace(tzinfo=None)
+    all_signals: List[dict] = []
+    checked = 0
+    missing_day_codes: List[str] = []
+    for code, df in klines.items():
+        df = df.copy()
+        df["时间"] = pd.to_datetime(df["时间"])
+        df = df[df["时间"] <= now_naive].sort_values("时间")
+        if df.empty:
+            continue
+        signals, details = replay_signals_for_stock(df, target, code, name_map.get(code, code))
+        if not details:
+            missing_day_codes.append(code)
+            continue
+        checked += 1
+        for line in details:
+            logger.info("[复盘] %s %s | %s", code, name_map.get(code, code), line)
+        all_signals.extend(signals)
+
+    if checked == 0:
+        alarms.append(
+            f"目标日 {target} 无任何股票的K线数据（可能超出近 5 个交易日保留范围，ADR-0004）"
+        )
+        send_wechat_messages([alarm_message(alarms)])
+        return 0
+    if missing_day_codes:
+        logger.warning("以下股票目标日无数据，跳过（ADR-0008 静默）: %s", ", ".join(missing_day_codes))
+    logger.info("复盘完成：%d 只股票，%d 个上穿信号", checked, len(all_signals))
+
+    # 5. 消息（ADR-0013 决策点②：推送复盘消息；dry_run 时只打印）
+    contents = build_replay_message(target, checked, all_signals)
+    if alarms:
+        alarm_text = alarm_message(alarms)
+        merged = contents[-1] + "\n\n" + alarm_text
+        if len(merged.encode("utf-8")) <= MSG_SAFE_BYTES:
+            contents[-1] = merged
+        else:
+            contents.append(alarm_text)
+    send_wechat_messages(contents)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
 
 def main() -> int:
     setup_logging()
+
+    # 复盘模式（ADR-0013）：非交易日用 workflow_dispatch 的 replay flag 触发
+    if REPLAY:
+        return run_replay()
+
     now = datetime.now(TZ_CN)
     today = now.date()
     now_naive = now.replace(tzinfo=None)
@@ -334,17 +557,8 @@ def main() -> int:
     if missing_codes:
         alarms.append(f"代码表中未找到：{', '.join(missing_codes)}（名称将显示为代码）")
 
-    # 4. 抓取 15 分钟K线（串行 + 限速 + 重试）
-    klines: Dict[str, pd.DataFrame] = {}
-    failed_codes: List[str] = []
-    for code in codes:
-        df = fetch_15min_kline(code)
-        if df is None:
-            failed_codes.append(code)
-        else:
-            klines[code] = df
-    if failed_codes:
-        logger.warning("单股抓取失败（ADR-0008 静默跳过）: %s", ", ".join(failed_codes))
+    # 4. 抓取 15 分钟K线（串行 + 限速 + 重试，ADR-0011）
+    klines, failed_codes = fetch_all_klines(codes)
     if not klines:
         alarms.append(f"本轮全部股票抓取失败（{len(codes)} 只），数据源可能故障")
         send_wechat_messages([alarm_message(alarms)])
