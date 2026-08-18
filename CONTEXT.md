@@ -43,10 +43,12 @@
 | ADR-0014 | 多渠道推送：企业微信 + 飞书（interactive 卡片/lark_md + text 降级 + 可选加签）；有哪个推哪个 | 已确认 |
 | ADR-0015 | 数据源策略：GitHub runner 东财被封（nid 403 + 断连）→ K线新浪优先东财兜底（KLINE_SOURCE_PRIORITY）+ 东财补丁 + nid 失败缓存 | 已确认 |
 | ADR-0016 | 实时价检测模式：任意时刻可触发；判定「锚点前一根收盘价 ≤ MA60 < 实时价」（锚点法无状态）；接受重复推送；交易时段护栏（9:30–11:30 / 13:00–15:10） | **已实现** |
+| ADR-0017 | 外部调度：cron-job.org 每 5 分钟调 workflow_dispatch（PAT 最小权限）；GitHub schedule 降级为兜底 | 已确认 |
 
 ## 事实约束（已查证）
 
 - GitHub Actions `schedule` cron 最小粒度 5 分钟（可精确到分钟），job 启动有 30~60 秒延迟；**高负载时段（整点）可能延迟数分钟，且 schedule 运行失败无自动重试**。
+- **实测（2026-08-17）：5 分钟粒度 schedule 触发率极低**（全天仅 7 条、间隔漂移至 56 分钟），不可作为高频调度依赖 → 外部调度方案（ADR-0017）。
 - **仓库 60 天无 activity 时，GitHub 自动禁用 scheduled workflows**（本项目不做 keepalive，用户每日查看运行结果，接受风险）。
 - AKShare `stock_zh_a_hist_min_em`（东方财富源）分钟数据仅保留最近约 5 个交易日；高频密集调用会出现 HTTP 429，需指数退避重试。判定上穿需 ≥61 根历史K线（60 根算 MA + 1 根作上一根对比，ADR-0002/0004）。
 - **东方财富对云服务器 IP（GitHub Actions runner）风控断连**：nid 令牌接口（anonflow2）403 + 直连 RemoteDisconnected，已被实测确认。本项目 K 线默认**新浪优先、东财兜底**（ADR-0015，`KLINE_SOURCE_PRIORITY=sina,em`）；名称映射走新浪批量接口 `hq.sinajs.cn`。
